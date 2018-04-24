@@ -1,0 +1,545 @@
+#!/usr/bin/python
+"""
+    Author      :   Yasser Khan
+    Date        :   05-MAY-2017
+    Description :   Observer control script
+    
+    Modification
+    Date          Author          Comments
+    18-MAY-2017   YAK             Validated the script as per PEP-8 standard
+    25-MAY-2017   YAK             Changed config_tns function to non-interactive mode.
+"""
+
+import os
+import sys
+import logging
+import optparse
+import subprocess
+import re
+import time
+import itertools
+
+
+def indent(text, amount, ch=' '):
+    """
+    Align subprocess output along with the logging module information.
+    """
+
+    padding = amount * ch
+
+    return ''.join(padding + line for line in text.splitlines(True))
+
+
+def grep(pattern, word_list):
+    """
+    Search TNS name in an provided array.
+    """
+
+    expr = re.compile('\\b{0}\\b'.format(pattern.upper()))
+
+    return [elem for elem in map(str.upper, word_list) if expr.match(elem)]
+
+
+def diff(word1, word2):
+    """
+    Check the character difference of two db names and return the difference in count.
+    """
+
+    count = sum(1 for elem1, elem2 in zip(word1, word2) if elem1 != elem2)
+
+    return count
+
+
+def log_subprocess_output(pipe, audit):
+    """
+    Read output from subprocess.PIPE and arrange it in case of parallelism.
+    """
+
+    proc_output = ""
+    for line in iter(pipe.readline, b''):
+        if audit in ("audit", "audit_verbose"):
+            proc_output += line
+        else:
+            formatter = logging.Formatter('%(message)s')
+            logger.handlers[0].setFormatter(formatter)
+            logger.info(indent(line.rstrip(), 32))
+
+    return proc_output
+
+
+def get_sys_pass():
+    """
+    Get SYS password accordingly for prod and non-prod from openssl encrypted SYS password stored in /tools/dba volume.
+    """
+
+    env_cd_file = "/env_cd"
+    nonprod_hash_file = "/.password_non_prod"
+    prod_hash_file = "/.password_prod"
+
+    try:
+        with open(env_cd_file, 'r') as env:
+            if os.path.getsize(env_cd_file) <= 0:
+                print "file /env_cd is empty"
+                sys.exit()
+            else:
+                for line in env:
+                    env_cd = line.strip()
+    except IOError:
+        print 'File does not exists -- /env_cd'
+        sys.exit()
+    else:
+        if env_cd in ("qa/client", "dev"):
+            hash_file = nonprod_hash_file
+        elif env_cd == "prod":
+            hash_file = prod_hash_file
+        try:
+            with open(hash_file, 'r') as passfile:
+                for line in passfile:
+                    passwd = line.split('=')[0]
+                    if passwd == "WALLETPASSWORDENCRYPTED":
+                        sys_pass = line.split('=', 1)[1]
+        except IOError:
+            print "File does not exists -- " + hash_file
+            sys.exit()
+
+    cmd = ' echo "' + sys_pass + '" | openssl enc -base64 -d | openssl enc -des3 -k secret_pass1! -d'
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    (sys_pass, err) = proc.communicate()
+
+    return sys_pass
+
+
+def send_mail(to):
+    """
+    Send mail when mass start/stop operation is performed.
+    """
+
+    import smtplib
+    import textwrap
+
+    server = "relay.service"
+    observer_host = os.uname()[1]
+    sender = "from@world.com"
+    subject = "Script " + os.path.basename(sys.argv[0]) + " in observer VM --> " + observer_host + " have performed start/stop action on all the observers"
+    text = "Mass operation start/stop for all the FSFO observers is performed using " + os.path.basename(sys.argv[0]) + " script "
+    message = textwrap.dedent("""\
+        from: %s
+        to: %s
+        subject: %s
+        %s
+        """ % (sender, to, subject, text))
+    try:
+        server = smtplib.SMTP(server)
+        server.sendmail(sender, [to], message)
+        server.quit()
+    except OSError:
+        logger.error(indent("Error: unable to send email", 32))
+
+    return
+
+
+def check_required_arguments(opts, parser):
+    """
+    Validate the arguments and values passed to this script.
+    """
+
+    missing_options = []
+    for option in parser.option_list:
+        if not opts.add_tns:
+            if re.match(r'^\[MANDATORY\]', option.help) and eval('opts.' + option.dest) is None:
+                missing_options.extend(option._long_opts)
+    if len(missing_options) > 0:
+        print "\nMissing MANDATORY parameters: " + str(missing_options) + "\n\n"
+        parser.print_help()
+        sys.exit()
+
+    if opts.what and opts.what.lower() not in ('start', 'stop', 'disable', 'enable', 'status', 'status_all', 'audit', 'audit_verbose'):
+        print "\nArgument value for --what is invalid\n\n"
+        parser.print_help()
+        sys.exit()
+
+    return
+
+
+def check_observer(tns):
+    """
+    Verify if Observer is running or not.
+    """
+
+    process = subprocess.Popen("ps -ef | grep -i " + tns.split('.')[0][:-1] + " | grep -v grep | grep -v " + os.path.basename(__file__), shell=True, stdout=subprocess.PIPE)
+    process_stdout, process_err = process.communicate()
+    if process_stdout:
+        process_id = process_stdout.split()[1]
+        return process_id
+    else:
+        return
+
+
+def getopts_parse():
+    """
+    Option parsing for this script.
+    """
+
+    desc = "Available options/arguments for this script are as shown below. Please be cautious while stopping/starting all the Observers. It is recommended to perform audit before using ALL option."
+
+    epi_msg = """
+Examples:
+
+        fsfo_observer_control -a "<DB_DOMAIN_NAME>,<PRIMARY_DB_UNIQUE_NAME>,<STANDBY_DB_UNIQUE_NAME>,<PRIMARY_SCAN/HOST_NAME>,<STANDBY_SCAN/HOST_NAME>"
+        fsfo_observer_control -d db1 -w status
+        fsfo_observer_control -d db1 -w status_all
+        fsfo_observer_control -d "db1,db2,db3" -w status
+        fsfo_observer_control -d "db1,db2,db3" -w disable
+        fsfo_observer_control -d "db1,db2,db3" -w enable
+        fsfo_observer_control -d all -w stop
+        fsfo_observer_control -d all -w start
+        fsfo_observer_control -d all -w audit
+        fsfo_observer_control -d all -w audit_verbose -l /home/oracle/mylog.log
+        fsfo_observer_control -d all -w status -q -c -l /home/oracle/mylog.log
+        fsfo_observer_control -d all -w disable -q -c
+
+"""
+    optparse.OptionParser.format_epilog = lambda self, formatter: self.epilog
+    parser = optparse.OptionParser(description=desc, version='%prog version 1.0', epilog=epi_msg)
+    parser.add_option("-l", "--logfile", dest="logfile", default="/dba/output/fsfo_observer_control/fsfo_observer_control.log",
+                      help="[OPTIONAL]logging file name (default %default)")
+    parser.add_option("-v", "--loglevel", dest="loglevel", default="info", 
+                      help="[OPTIONAL]logging level (info, error)")
+    parser.add_option("-q", "--quiet", dest="quiet", action="store_true", default=False,
+                      help="[OPTIONAL]do not log to console")
+    parser.add_option("-c", "--clean", dest="clean", action="store_true", default=False,
+                      help="[OPTIONAL]remove old log file")
+    parser.add_option("-w", "--what", dest="what",
+                      help="[MANDATORY] What operation to do - start/stop/status/disable/enable/audit/audit_verbose")
+    parser.add_option("-d", "--database", dest="db", 
+                      help='[MANDATORY] Primary db name, "db1,db2...", ALL')
+    parser.add_option("-a", "--add_tns", dest="add_tns",
+                      help="[ANONYMOUS]configure primary and standby TNS")
+
+    (opt, arg) = parser.parse_args()
+    check_required_arguments(opt, parser)
+
+    return opt, arg
+
+
+def initialize_logging(opts):
+    """
+    Configure logging module for printing data into stdout and log file.
+    """
+    global custom_formatter
+    global hdlr2
+
+    custom_formatter = logging.Formatter('%(message)s')
+
+    loggerr = logging.getLogger(__name__)
+    formatter = logging.Formatter('%(asctime)s %(levelname)s\t%(message)s')
+    level = logging.__dict__.get(opts.loglevel.upper(), logging.DEBUG)
+    loggerr.setLevel(level)
+
+    if not opts.quiet:
+        hdlr = logging.StreamHandler(sys.stderr)
+        hdlr.setFormatter(formatter)
+        loggerr.addHandler(hdlr)
+
+    logfile = opts.logfile
+    if opts.clean and os.path.isfile(logfile):
+        os.remove(logfile)
+    hdlr2 = logging.FileHandler(logfile)
+    hdlr2.setFormatter(formatter)
+    loggerr.addHandler(hdlr2)
+
+    return loggerr
+
+
+def config_tns(provide_tns_details):
+    """
+    Configure Observer by appending TNS entries of Primary and Standby databases by taking backup of original tnsnames.ora file into snap volume.
+    """
+
+    import shutil
+  
+    config_info = provide_tns_details.split(',')
+
+    try:
+        domain   = config_info[0].strip().lower()
+        prim_db  = config_info[1].strip().lower()
+        stdby_db = config_info[2].strip().lower()
+        prim_ip  = config_info[3].strip().lower()
+        stdby_ip = config_info[4].strip().lower()
+        
+        tns_file = os.environ["ORACLE_HOME"] + "/network/admin/tnsnames.ora"
+        bkp_tns_file = os.path.realpath(tns_file) + time.strftime(".%d_%m_%y-%H:%M")
+        
+        shutil.copy(tns_file, bkp_tns_file)
+        
+        with open(tns_file, "a") as f:
+            f.write("\n{0}.{1} = " \
+                    "\n  (DESCRIPTION = " \
+                    "\n     (ADDRESS_LIST = " \
+                    "\n       (ADDRESS = (PROTOCOL = TCP)(HOST = {2}.{3})(PORT = 1521)) " \
+                    "\n     ) " \
+                    "\n     (CONNECT_DATA = " \
+                    "\n       (SERVICE_NAME = {4}.{5}) " \
+                    "\n     ) " \
+                    "\n   ) " \
+                    "\n " \
+                    "\n{6}.{7} = " \
+                    "\n  (DESCRIPTION = " \
+                    "\n     (ADDRESS_LIST = " \
+                    "\n       (ADDRESS = (PROTOCOL = TCP)(HOST = {8}.{9})(PORT = 1521)) " \
+                    "\n     ) " \
+                    "\n     (CONNECT_DATA = " \
+                    "\n       (SERVICE_NAME = {10}.{11}) " \
+                    "\n     ) " \
+                    "\n   ) " \
+                    "\n ".format(prim_db.upper(), domain.upper(), prim_ip, domain, prim_db, domain, stdby_db.upper(), domain.upper(), stdby_ip, domain, stdby_db, domain))
+        logger.info("Primary - {0} and Standby - {1} database TNS entries have been appended into tnsnames.ora file. Please start the Observer...".format(prim_db.upper(), stdby_db.upper()))
+    except:
+        print "Unable to configure TNS, please add Primary and Standby TNS entries into tnsnames.ora file manually..."
+  
+    return
+
+
+def parse_tns(search):
+    """
+    Parse tnsnames.ora file and return populated array with corresponding TNS entries.
+    """
+
+    tns_list = []
+    tnsnames_file = os.environ["ORACLE_HOME"] + "/network/admin/tnsnames.ora"
+    with open(tnsnames_file, 'r') as tns_file:
+        for line in tns_file:
+            if line and line[0].isalpha():
+                tns_list.append(line.split('=')[0].strip())
+    if options.add_tns:
+        config_tns(options.add_tns)
+        sys.exit()
+    elif options.db.upper() != "ALL" and options.what in ("audit", "audit_verbose"):
+        print chr(27) + "[0m" + chr(27) + "[2J" + chr(27) + "[H"
+        logger.error("\033[0;37;41m Audit can't be performed on individual databases. Use ALL for audit \033[00m\n")
+        sys.exit()
+    elif options.db.upper() == "ALL":
+        print chr(27) + "[0m" + chr(27) + "[2J" + chr(27) + "[H"
+        if options.what.upper() in ("START", "STOP"):
+            send_mail('to@world.com')
+        final_list = []
+        for a in itertools.combinations(tns_list, 2):
+            if len(a[0]) == len(a[1]):
+                f = a[0].split('.')
+                l = a[1].split('.')
+                if f[0][:-1].upper() == l[0][:-1].upper():
+                    cnt = diff(f, l)
+                    if cnt == 1:
+                        final_list.append(a[0])
+        return final_list
+    else:
+        print chr(27) + "[0m" + chr(27) + "[2J" + chr(27) + "[H"
+        sep_list = search.split(',')
+        final_list = []
+        if '' in sep_list:
+            logger.error("\033[0;37;41mPlease use double quotes for multiple db names\033[00m\n")
+            sys.exit()
+        for each_tns in sep_list:
+            match_found = grep(each_tns, tns_list)
+            if match_found:
+                final_list.extend(match_found)
+            else:
+                logger.error("\033[0;37;41mCorresponding TNS not found for db -- {0} \033[00m\n".format(each_tns))
+        return final_list
+
+
+def observer(search, what):
+    """
+    Perform all Observer related actions on provided DB name.
+    Handles parallelism through python array LIST only when action is for ALL the databases.
+    Timeout of each subprocess is set to 10 seconds.
+    Audit operation is applicable only for ALL the databases and it is performed in parallel
+    """
+
+    if what == "status":
+        broker_cmd = "\" show fast_start failover \""
+        display_msg = "FSFO status for DB "
+    elif what == "status_all":
+        broker_cmd = "\" show configuration verbose \""
+        display_msg = "Configuration status of DB"
+    elif what == "stop":
+        broker_cmd = "\" stop observer \""
+        display_msg = "Stopping FSFO Observer for DB "
+    elif what == "start":
+        display_msg = "Starting Observer for DB "
+    elif what == "disable":
+        broker_cmd = "\" disable fast_start failover \""
+        display_msg = "Disabling FSFO for DB "
+    elif what == "enable":
+        broker_cmd = "\" enable fast_start failover \""
+        display_msg = "Enabling FSFO for DB "
+    elif what in ("audit", "audit_verbose"):
+        broker_cmd = "\" show configuration verbose \""
+        display_msg = "Auditing all the tns entries"
+
+    parallel_commands = []
+    for each_tns in search:
+        config_name = each_tns.split('.')[0]
+        config_name = config_name[:-1]
+        if what == "start":
+            logger.info("\033[0;30;47m{0}\033[00m".format("-" * 78))
+            logger.info("\033[0;30;47m {0} {1}\033[00m".format(display_msg.rjust(30), each_tns.ljust(46)))
+            logger.info("\033[0;30;47m{0}\033[00m".format("-" * 78))
+            observer_pid = check_observer(each_tns)
+            if observer_pid:
+                logger.info("Observer for {0} is already running with process id - {1} \n ".format(each_tns, observer_pid))
+            else:
+                dgmgrl_cmd = "nohup " + os.environ["ORACLE_HOME"] + \
+                             "/bin/dgmgrl" + " -logfile /admin1/fsfo_log/" + \
+                             config_name + "_observer.log" + " sys/" + paswd + "@" + each_tns + " " + \
+                             "\"start observer file='/s01/oraadmin1/fsfo_dat/" + \
+                             config_name + "_fsfo.dat'\""
+                dgmgrl_conn = subprocess.Popen(dgmgrl_cmd, stdout=open('/dev/null', 'w'), stderr=open('/dev/null', 'a'), preexec_fn=os.setpgrp, shell=True)
+                if options.db.upper() == "ALL":  # No post checking for ALL option
+                    logger.info("Process ID of this background Observer is -- {0} \n".format(dgmgrl_conn.pid))
+                else:
+                    time.sleep(8)
+                    start_observer_pid = check_observer(each_tns)
+                    if start_observer_pid:
+                        logger.info("Process ID of this background Observer is -- {0} \n".format(dgmgrl_conn.pid))
+                    else:  # Bounce Observer if it is down abruptly and dat file is unknown
+                        dgmgrl_show_cmd = os.environ["ORACLE_HOME"] + "/bin/dgmgrl -silent " + "sys/" + paswd + "@" + each_tns + " " + "\" show configuration verbose \""
+                        dgmgrl_show_conn = subprocess.Popen(dgmgrl_show_cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        (results, errors) = dgmgrl_show_conn.communicate(dgmgrl_show_cmd)
+                        if re.search(r'\bORA-16820\b', results):  # If Observer has been stopped abruptly
+                            dgmgrl_stop_cmd = os.environ["ORACLE_HOME"] + "/bin/dgmgrl -silent " + "sys/" + paswd + "@" + each_tns + " " + "\" stop observer \""
+                            dgmgrl_stop_conn = subprocess.Popen(dgmgrl_stop_cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            # Try to start again after stopping Observer
+                            dgmgrl_conn = subprocess.Popen(dgmgrl_cmd, stdout=open('/dev/null', 'w'), stderr=open('/dev/null', 'a'), preexec_fn=os.setpgrp, shell=True)
+                            time.sleep(5)
+                            start_observer_pid = check_observer(each_tns)
+                            if start_observer_pid:
+                                logger.info("Process ID of this background Observer is -- {0} \n".format(dgmgrl_conn.pid))
+                        else:
+                            logger.error("FAILED...unable to start Observer for DB - {0}".format(each_tns))
+        else:
+            pdgmgrl_cmd = "THIS_TNS" + "=" + each_tns + " ; echo -e \"\n\n\e[7m             $THIS_TNS            \e[27m\" ; " + \
+                          " date ; timeout 10 " + os.environ["ORACLE_HOME"] + \
+                          "/bin/dgmgrl -silent " + "sys/" + paswd + "@" + each_tns + " " + broker_cmd + \
+                          "; if [ $? = 124 ] ; then echo \"Killed $THIS_TNS due to timeout\"; fi"
+            parallel_commands.append(pdgmgrl_cmd)
+
+    if options.db.upper() == "ALL" and what != "start":  # parallelism meant only when performing ALL operation except START of Observer
+        max_workers = 250  # Max concurrency
+        processes = (subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) for cmd in parallel_commands)
+        running_processes = list(itertools.islice(processes, max_workers))  # start new processes
+
+        logger.info("\033[0;30;47m{0}\033[00m".format("-" * 78))
+        logger.info("\033[0;30;47m                 {0} - Operating on ALL tns entries                 \033[00m".format(what.rjust(13)))
+        logger.info("\033[0;30;47m{0}\033[00m\n".format("-" * 78))
+
+        timeout_list = []
+        error_db = []
+        success_db = []
+        disable_db = []
+        obs_stopped = []
+        invalid_passwd_list = []
+        while running_processes:
+            for i, process in enumerate(running_processes):
+                if process.poll() is not None:  # the process has finished
+                    if options.what in ("audit", "audit_verbose"):
+                        proc_out = log_subprocess_output(process.stdout, options.what)
+                        config_name = re.findall(r'- (.*)', proc_out)
+                        if re.search(r'\bKilled\b|\btimeout\b', proc_out):
+                            timeout_list.append(re.findall(r'Killed (.*)', proc_out)[0].split()[0])
+                        elif re.search(r'\bORA-01017\b', proc_out):
+                            db_name = proc_out.split('\n', 4)[2]
+                            invalid_passwd_list.append(db_name.split()[1])
+                        elif re.search(r'\bORA-16819\b', proc_out) and re.search(r'\bENABLED\b', proc_out):
+                            obs_stopped.append(config_name[0].upper())
+                        elif re.search(r'\bWARNING\b|\bERROR\b', proc_out):
+                            error_db.append(config_name[0].upper())
+                        elif re.search(r'\bSUCCESS\b', proc_out) and re.search(r'\bENABLED\b', proc_out):
+                            success_db.append(config_name[0].upper())
+                        elif re.search(r'\bSUCCESS\b', proc_out) and re.search(r'\bDISABLED\b', proc_out):
+                            disable_db.append(config_name[0].upper())
+                    else:
+                        hdlr2.setFormatter(custom_formatter)
+                        log_subprocess_output(process.stdout, options.what)
+                    running_processes[i] = next(processes, None)  # start new process
+                    if running_processes[i] is None:  # no new processes
+                        del running_processes[i]
+                        break
+
+        main_list = [''.join(list(i.rstrip().partition('.')[0][:-1]) + list(i.rstrip().partition('.')[1:])) for i in search]
+        timedout_list = [''.join(list(i.rstrip().partition('.')[0][:-1]) + list(i.rstrip().partition('.')[1:])) for i in timeout_list]
+        invalid_paswd_list = [''.join(list(i.rstrip().partition('.')[0][:-1]) + list(i.rstrip().partition('.')[1:])) for i in invalid_passwd_list]
+        others_list = list(set(main_list) - (set(success_db) | set(error_db) | set(disable_db) | set(timedout_list) | set(obs_stopped) | set(invalid_paswd_list)))
+
+        if options.what in ("audit", "audit_verbose"):
+            logger.handlers[0].setFormatter(custom_formatter)
+            hdlr2.setFormatter(custom_formatter)
+            logger.info(indent("Total TNS entries having FSFO in SUCCESS state        => {0}".format(str(len(success_db))), 32))
+            logger.info(indent("Total TNS entries having FSFO in DISABLED state       => {0}".format(str(len(disable_db))), 32))
+            logger.info(indent("Total TNS entries having FSFO in ERROR state          => {0}".format(str(len(error_db))), 32))
+            logger.info(indent("Total TNS entries having FSFO Observer STOPPED        => {0}".format(str(len(obs_stopped))), 32))
+            logger.info(indent("Total TNS entries which got TIMED-OUT while reaching  => {0}".format(str(len(timedout_list))), 32))
+            logger.info(indent("Total TNS entries failed due to invalid SYS password  => {0}".format(str(len(invalid_paswd_list))), 32))
+            logger.info(indent("Total TNS entries which belongs to UNKNOWN state      => {0}\n".format(str(len(others_list))), 32))
+
+            if options.what == "audit_verbose":
+                if len(success_db) > 0:
+                    logger.info(indent("List of config names in SUCCESS state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in success_db))
+                if len(error_db) > 0:
+                    logger.info(indent("\nList of config names in ERROR state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in error_db))
+                if len(disable_db) > 0:
+                    logger.info(indent("\nList of config names in DISABLE state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in disable_db))
+                if len(obs_stopped) > 0:
+                    logger.info(indent("\nList of config names in OBS-STOPPED state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in obs_stopped))
+                if len(timedout_list) > 0:
+                    logger.info(indent("\nList of config names in TIMED-OUT state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in timedout_list))
+                if len(invalid_paswd_list) > 0:
+                    logger.info(indent("\nList of config names in INVALID-SYS-PASWD state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in invalid_paswd_list))
+                if len(others_list) > 0:
+                    logger.info(indent("\nList of config names in UNKNOWN state :-", 32))
+                    logger.info('\n'.join(indent(db, 40) for db in others_list))
+    elif options.db.upper() != "ALL" and what != "start":  # Serial execution which is default if not using ALL option
+        for each_tns in search:
+            logger.info("\033[0;30;47m{0}\033[00m".format("-" * 78))
+            logger.info("\033[0;30;47m {0} {1}\033[00m".format(display_msg.rjust(30), each_tns.ljust(46)))
+            logger.info("\033[0;30;47m{0}\033[00m".format("-" * 78))
+
+            dgmgrl_cmd = "THIS_TNS" + "=" + each_tns + " ; timeout 10 " + os.environ["ORACLE_HOME"] + "/bin/dgmgrl -silent " + "sys/" + paswd + "@" + each_tns + " " + broker_cmd + \
+                         "; if [ $? = 124 ] ; then echo \"Killed $THIS_TNS due to timeout\"; fi"
+            dgmgrl_conn = subprocess.Popen(dgmgrl_cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            (results, errors) = dgmgrl_conn.communicate(dgmgrl_cmd)
+
+            if not results.strip():
+                logger.info(broker_cmd.strip() + " command completed")
+            else:
+                logger.info("\n" + indent(results, 32))
+    return
+
+
+def main():
+    """
+    Main method calling all other methods respectively.
+    """
+
+    global options
+    global logger
+    global paswd
+
+    (options, args) = getopts_parse()
+    logger = initialize_logging(options)
+
+    tns_iterator = parse_tns(options.db)
+    paswd = get_sys_pass()
+    observer(tns_iterator, options.what)
+
+    return
+
+
+if __name__ == "__main__":
+    main()
